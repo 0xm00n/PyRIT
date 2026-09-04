@@ -1,4 +1,5 @@
 import { makeStyles, tokens } from '@fluentui/react-components'
+import { mobileTouchTarget } from '../../styles/touchTargets'
 
 export const useLabelsBarStyles = makeStyles({
   root: {
@@ -6,8 +7,21 @@ export const useLabelsBarStyles = makeStyles({
     alignItems: 'center',
     gap: tokens.spacingHorizontalXS,
     overflow: 'hidden',
-    flex: '1 1 0',
-    minWidth: 0,
+    // Always reserve enough room for the labels icon + count badge so it
+    // stays visible at any ribbon width. `minWidth` is the width of the
+    // icon button alone; the chip area beyond it grows when there's
+    // additional space.
+    flex: '1 1 auto',
+    minWidth: '60px',
+    position: 'relative',
+  },
+  iconButton: {
+    flexShrink: 0,
+    ...mobileTouchTarget,
+  },
+  iconTooltipBody: {
+    whiteSpace: 'nowrap',
+    minWidth: 'max-content',
   },
   labelsContainer: {
     display: 'flex',
@@ -18,18 +32,26 @@ export const useLabelsBarStyles = makeStyles({
     flex: '1 1 0',
     minWidth: 0,
   },
-  overflowBadge: {
-    flexShrink: 0,
-    cursor: 'pointer',
+  measureRow: {
+    position: 'absolute',
+    visibility: 'hidden',
+    pointerEvents: 'none',
+    whiteSpace: 'nowrap',
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: tokens.spacingHorizontalXS,
+    top: 0,
+    left: 0,
   },
   labelBadge: {
-    display: 'flex',
+    display: 'inline-flex',
     alignItems: 'center',
     gap: tokens.spacingHorizontalXXS,
-    padding: `2px ${tokens.spacingHorizontalS}`,
+    padding: `0 ${tokens.spacingHorizontalS}`,
     borderRadius: tokens.borderRadiusMedium,
     cursor: 'pointer',
     userSelect: 'none' as const,
+    flexShrink: 0,
   },
   labelNormal: {
     backgroundColor: tokens.colorNeutralBackground3,
@@ -38,6 +60,21 @@ export const useLabelsBarStyles = makeStyles({
   labelDummy: {
     backgroundColor: tokens.colorPaletteYellowBackground2,
     border: `1px solid ${tokens.colorPaletteYellowBorder1}`,
+  },
+  labelEdit: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: tokens.spacingHorizontalXXS,
+    // The badge keeps the horizontal padding so the pill looks the same; the
+    // vertical padding lives here so the whole height of it starts an edit.
+    padding: '2px 0',
+    background: 'none',
+    border: 'none',
+    margin: 0,
+    font: 'inherit',
+    color: 'inherit',
+    cursor: 'pointer',
+    userSelect: 'none' as const,
   },
   removeBtn: {
     minWidth: '16px',
@@ -51,6 +88,12 @@ export const useLabelsBarStyles = makeStyles({
     gap: tokens.spacingVerticalS,
     padding: tokens.spacingVerticalM,
     minWidth: '250px',
+  },
+  popoverDivider: {
+    height: '1px',
+    backgroundColor: tokens.colorNeutralStroke2,
+    marginTop: tokens.spacingVerticalXS,
+    marginBottom: tokens.spacingVerticalXS,
   },
   inputRow: {
     display: 'flex',
@@ -85,6 +128,33 @@ export const useLabelsBarStyles = makeStyles({
     overflowY: 'auto',
     minWidth: '120px',
   },
+  // The picker is wider than the plain input it replaces, and the labels bar
+  // clips what overflows. Let it shrink rather than lose its chevron: Fluent
+  // puts an intrinsic min-width on both the root and the inner input.
+  operationPicker: {
+    width: '180px',
+    minWidth: 0,
+    maxWidth: '100%',
+    '& input': {
+      minWidth: 0,
+    },
+  },
+  // Caps the list so it stays under the input instead of stretching to fill
+  // the window. This only takes effect because the picker asks Fluent to
+  // auto-size width alone; by default it writes its own max-height inline,
+  // which beats this rule. Asking for width alone also gives up Fluent's
+  // vertical fitting, so the cap yields to the viewport when it has to.
+  operationListbox: {
+    maxHeight: 'min(240px, calc(100vh - 32px))',
+  },
+  // Fluent dims disabled options to ~1.9:1 contrast, which is too faint for
+  // text the user has to read. These are messages, not choices.
+  operationNote: {
+    color: tokens.colorNeutralForeground2,
+  },
+  operationNoteError: {
+    color: tokens.colorPaletteRedForeground1,
+  },
   suggestionChip: {
     cursor: 'pointer',
     ':hover': {
@@ -98,5 +168,6 @@ export const useLabelsBarStyles = makeStyles({
     color: tokens.colorPaletteYellowForeground2,
     display: 'flex',
     alignItems: 'center',
+    flexShrink: 0,
   },
 })

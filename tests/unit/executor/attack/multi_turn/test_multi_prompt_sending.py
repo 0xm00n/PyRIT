@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pyrit.converter import Base64Converter, StringJoinConverter
 from pyrit.executor.attack import (
     AttackConverterConfig,
     AttackScoringConfig,
@@ -15,17 +16,26 @@ from pyrit.executor.attack import (
     MultiPromptSendingAttackParameters,
     MultiTurnAttackContext,
 )
-from pyrit.identifiers import ComponentIdentifier
+from pyrit.executor.attack.component import PrependedConversationConfig
+from pyrit.executor.attack.component.prepended_history_send_context import (
+    PrependedHistorySendContext,
+)
+from pyrit.message_normalizer import HistorySquashNormalizer, MessageStringNormalizer
 from pyrit.models import (
     AttackOutcome,
     AttackResult,
+    ComponentIdentifier,
     Message,
     MessagePiece,
     Score,
 )
-from pyrit.prompt_converter import Base64Converter, StringJoinConverter
-from pyrit.prompt_normalizer import PromptConverterConfiguration, PromptNormalizer
-from pyrit.prompt_target import PromptTarget
+from pyrit.prompt_normalizer import ConverterConfiguration, PromptNormalizer
+from pyrit.prompt_target import (
+    CapabilityName,
+    PromptTarget,
+    TargetCapabilities,
+    TargetConfiguration,
+)
 from pyrit.score import Scorer, TrueFalseScorer
 
 
@@ -160,8 +170,8 @@ class TestMultiPromptSendingAttackInitialization:
 
     def test_init_with_all_custom_configurations(self, mock_target, mock_true_false_scorer, mock_prompt_normalizer):
         converter_cfg = AttackConverterConfig(
-            request_converters=[PromptConverterConfiguration(converters=[Base64Converter()])],
-            response_converters=[PromptConverterConfiguration(converters=[StringJoinConverter()])],
+            request_converters=[ConverterConfiguration(converters=[Base64Converter()])],
+            response_converters=[ConverterConfiguration(converters=[StringJoinConverter()])],
         )
         scoring_cfg = AttackScoringConfig(objective_scorer=mock_true_false_scorer)
 
@@ -256,7 +266,6 @@ class TestContextValidation:
 class TestSetupPhase:
     """Tests for the setup phase of the attack"""
 
-    @pytest.mark.asyncio
     async def test_setup_initializes_conversation_session(self, mock_target, basic_context):
         attack = MultiPromptSendingAttack(objective_target=mock_target)
         basic_context.session = None
@@ -269,7 +278,6 @@ class TestSetupPhase:
         assert basic_context.session is not None
         assert isinstance(basic_context.session, ConversationSession)
 
-    @pytest.mark.asyncio
     async def test_setup_merges_memory_labels_correctly(self, mock_target, basic_context):
         attack = MultiPromptSendingAttack(objective_target=mock_target)
         attack._memory_labels = {"strategy_label": "strategy_value", "common": "strategy"}
@@ -291,9 +299,8 @@ class TestSetupPhase:
             "common": "context",
         }
 
-    @pytest.mark.asyncio
     async def test_setup_updates_conversation_state_with_converters(self, mock_target, basic_context):
-        converter_config = [PromptConverterConfiguration(converters=[])]
+        converter_config = [ConverterConfiguration(converters=[])]
         attack = MultiPromptSendingAttack(
             objective_target=mock_target,
             attack_converter_config=AttackConverterConfig(request_converters=converter_config),
@@ -314,12 +321,40 @@ class TestSetupPhase:
 class TestPromptSending:
     """Tests for sending prompts to target"""
 
-    @pytest.mark.asyncio
+    async def test_send_prompt_forwards_prepended_formatter_override(
+        self, mock_target, mock_prompt_normalizer, basic_context, sample_response
+    ):
+        mock_target.configuration = TargetConfiguration(capabilities=TargetCapabilities(supports_multi_turn=True))
+        formatter = MagicMock(spec=MessageStringNormalizer)
+        attack = MultiPromptSendingAttack(
+            objective_target=mock_target,
+            prompt_normalizer=mock_prompt_normalizer,
+            prepended_conversation_config=PrependedConversationConfig(message_normalizer=formatter),
+        )
+        target_context = PrependedHistorySendContext(
+            conversation_id=basic_context.session.conversation_id,
+            seed_message_ids=(uuid.uuid4(),),
+            replay_seed_each_send=False,
+        )
+        basic_context.prepended_history_send_context = target_context
+        mock_prompt_normalizer.send_prompt_async.return_value = sample_response
+
+        await attack._send_prompt_to_objective_target_async(
+            current_message=Message.from_prompt(prompt="test prompt", role="user"),
+            context=basic_context,
+        )
+
+        send_kwargs = mock_prompt_normalizer.send_prompt_async.await_args.kwargs
+        override = send_kwargs["normalizer_overrides"][CapabilityName.EDITABLE_HISTORY]
+        assert isinstance(override, HistorySquashNormalizer)
+        assert override._message_normalizer is formatter
+        assert send_kwargs["send_context"] is target_context
+
     async def test_send_prompt_to_target_with_all_configurations(
         self, mock_target, mock_prompt_normalizer, basic_context, sample_response
     ):
-        request_converters = [PromptConverterConfiguration(converters=[])]
-        response_converters = [PromptConverterConfiguration(converters=[])]
+        request_converters = [ConverterConfiguration(converters=[])]
+        response_converters = [ConverterConfiguration(converters=[])]
 
         attack = MultiPromptSendingAttack(
             objective_target=mock_target,
@@ -339,7 +374,6 @@ class TestPromptSending:
         assert result == sample_response
         mock_prompt_normalizer.send_prompt_async.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_send_prompt_handles_none_response(self, mock_target, mock_prompt_normalizer, basic_context):
         mock_prompt_normalizer.send_prompt_async.return_value = None
 
@@ -358,14 +392,13 @@ class TestPromptSending:
 class TestResponseEvaluation:
     """Tests for response evaluation logic"""
 
-    @pytest.mark.asyncio
     async def test_evaluate_response_with_objective_scorer_returns_score(
         self, mock_target, mock_true_false_scorer, sample_response, success_score
     ):
         attack_scoring_config = AttackScoringConfig(objective_scorer=mock_true_false_scorer)
         attack = MultiPromptSendingAttack(objective_target=mock_target, attack_scoring_config=attack_scoring_config)
 
-        with patch("pyrit.score.Scorer.score_response_async") as mock_score:
+        with patch("pyrit.score.MessageScorer.score_response_async") as mock_score:
             mock_score.return_value = {"objective_scores": [success_score]}
 
             result = await attack._evaluate_response_async(response=sample_response, objective="test objective")
@@ -373,7 +406,6 @@ class TestResponseEvaluation:
             assert result == success_score
             mock_score.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_evaluate_response_without_objective_scorer_returns_none(self, mock_target, sample_response):
         attack = MultiPromptSendingAttack(objective_target=mock_target)
 
@@ -381,7 +413,6 @@ class TestResponseEvaluation:
 
         assert result is None
 
-    @pytest.mark.asyncio
     async def test_evaluate_response_with_auxiliary_scorers(
         self, mock_target, mock_true_false_scorer, sample_response, success_score
     ):
@@ -392,7 +423,7 @@ class TestResponseEvaluation:
         )
         attack = MultiPromptSendingAttack(objective_target=mock_target, attack_scoring_config=attack_scoring_config)
 
-        with patch("pyrit.score.Scorer.score_response_async") as mock_score:
+        with patch("pyrit.score.MessageScorer.score_response_async") as mock_score:
             mock_score.return_value = {"objective_scores": [success_score]}
 
             result = await attack._evaluate_response_async(response=sample_response, objective="test objective")
@@ -407,7 +438,6 @@ class TestResponseEvaluation:
 class TestAttackExecution:
     """Tests for the main attack execution logic"""
 
-    @pytest.mark.asyncio
     async def test_perform_async_sends_all_prompts_in_sequence(
         self, mock_target, mock_prompt_normalizer, basic_context, sample_response
     ):
@@ -422,7 +452,6 @@ class TestAttackExecution:
         assert result.executed_turns == len(basic_context.params.user_messages)
         assert result.last_response is not None
 
-    @pytest.mark.asyncio
     async def test_perform_async_sets_atomic_attack_identifier(
         self, mock_target, mock_prompt_normalizer, basic_context, sample_response
     ):
@@ -437,7 +466,6 @@ class TestAttackExecution:
         assert result.atomic_attack_identifier.class_name == "AtomicAttack"
         assert result.get_attack_strategy_identifier() == attack.get_identifier()
 
-    @pytest.mark.asyncio
     async def test_perform_async_stops_on_failed_prompt(self, mock_target, mock_prompt_normalizer, basic_context):
         # First prompt succeeds, second fails
         mock_prompt_normalizer.send_prompt_async.side_effect = [
@@ -462,7 +490,6 @@ class TestAttackExecution:
         assert mock_prompt_normalizer.send_prompt_async.call_count == 2
         assert result.executed_turns == 1  # Only first prompt succeeded
 
-    @pytest.mark.asyncio
     async def test_perform_async_evaluates_final_response(
         self, mock_target, mock_true_false_scorer, mock_prompt_normalizer, basic_context, sample_response, success_score
     ):
@@ -539,7 +566,6 @@ class TestDetermineAttackOutcome:
 class TestExecuteAsync:
     """Tests for the execute_async method (main entry point)"""
 
-    @pytest.mark.asyncio
     async def test_execute_async_with_valid_parameters(self, mock_target):
         attack = MultiPromptSendingAttack(objective_target=mock_target)
 
@@ -563,7 +589,6 @@ class TestExecuteAsync:
             assert isinstance(result, AttackResult)
             mock_perform.assert_called_once()
 
-    @pytest.mark.asyncio
     async def test_execute_async_validates_messages_parameter(self, mock_target):
         """
         Test that execute_async validates the user_messages parameter.
@@ -577,7 +602,6 @@ class TestExecuteAsync:
                 # Missing user_messages parameter
             )
 
-    @pytest.mark.asyncio
     async def test_execute_async_passes_messages_to_context(self, mock_target):
         """
         Test that execute_async properly passes user_messages to the context.
@@ -612,12 +636,11 @@ class TestExecuteAsync:
 class TestConverterIntegration:
     """Tests for converter integration"""
 
-    @pytest.mark.asyncio
     async def test_perform_attack_with_converters(
         self, mock_target, mock_prompt_normalizer, basic_context, sample_response
     ):
         converter_config = AttackConverterConfig(
-            request_converters=[PromptConverterConfiguration(converters=[Base64Converter()])]
+            request_converters=[ConverterConfiguration(converters=[Base64Converter()])]
         )
         mock_prompt_normalizer.send_prompt_async.return_value = sample_response
 
@@ -633,12 +656,11 @@ class TestConverterIntegration:
         call_args = mock_prompt_normalizer.send_prompt_async.call_args[1]
         assert call_args["request_converter_configurations"] == converter_config.request_converters
 
-    @pytest.mark.asyncio
     async def test_perform_attack_with_response_converters(
         self, mock_target, mock_prompt_normalizer, basic_context, sample_response
     ):
         converter_config = AttackConverterConfig(
-            response_converters=[PromptConverterConfiguration(converters=[StringJoinConverter()])]
+            response_converters=[ConverterConfiguration(converters=[StringJoinConverter()])]
         )
         mock_prompt_normalizer.send_prompt_async.return_value = sample_response
 
@@ -659,7 +681,6 @@ class TestConverterIntegration:
 class TestEdgeCasesAndErrorHandling:
     """Tests for edge cases and error handling scenarios"""
 
-    @pytest.mark.asyncio
     async def test_perform_attack_with_empty_messages(
         self, mock_target, mock_prompt_normalizer, mock_true_false_scorer, basic_context
     ):
@@ -679,7 +700,6 @@ class TestEdgeCasesAndErrorHandling:
         assert result.last_response is None
         assert result.outcome == AttackOutcome.FAILURE
 
-    @pytest.mark.asyncio
     async def test_perform_attack_with_single_prompt(self, mock_target, mock_prompt_normalizer, sample_response):
         mock_prompt_normalizer.send_prompt_async.return_value = sample_response
 
@@ -707,7 +727,6 @@ class TestEdgeCasesAndErrorHandling:
         assert attack1.get_identifier().hash == attack2.get_identifier().hash
         assert attack1.get_identifier().class_name == "MultiPromptSendingAttack"
 
-    @pytest.mark.asyncio
     async def test_teardown_async_is_noop(self, mock_target, basic_context):
         attack = MultiPromptSendingAttack(objective_target=mock_target)
 

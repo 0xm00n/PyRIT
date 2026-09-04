@@ -1,12 +1,16 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-import warnings
-from dataclasses import fields
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pyrit.message_normalizer import GenericSystemSquashNormalizer, HistorySquashNormalizer
+from pyrit.message_normalizer import (
+    GenericSystemSquashNormalizer,
+    HistorySquashNormalizer,
+    JsonSchemaNormalizer,
+    MessageListNormalizer,
+)
 from pyrit.models import Message, MessagePiece
 from pyrit.models.literals import ChatMessageRole
 from pyrit.prompt_target.common.target_capabilities import (
@@ -15,7 +19,7 @@ from pyrit.prompt_target.common.target_capabilities import (
     TargetCapabilities,
     UnsupportedCapabilityBehavior,
 )
-from pyrit.prompt_target.common.target_configuration import TargetConfiguration, resolve_configuration_compat
+from pyrit.prompt_target.common.target_configuration import TargetConfiguration
 
 
 @pytest.fixture
@@ -46,14 +50,22 @@ def make_message():
 
 
 def test_init_with_defaults_uses_raise_policy():
-    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=True,
+        supports_system_prompt=True,
+    )
     config = TargetConfiguration(capabilities=caps)
     # Default policy is RAISE for all adaptable capabilities
     assert config.policy.get_behavior(capability=CapabilityName.MULTI_TURN) == UnsupportedCapabilityBehavior.RAISE
 
 
 def test_init_with_explicit_policy(adapt_all_policy):
-    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=True,
+        supports_system_prompt=True,
+    )
     config = TargetConfiguration(capabilities=caps, policy=adapt_all_policy)
     assert config.policy is adapt_all_policy
 
@@ -74,10 +86,132 @@ def test_init_missing_capability_adapt_builds_pipeline(adapt_all_policy):
 
 def test_init_missing_capability_raise_policy_skips_normalizer():
     caps = TargetCapabilities(supports_multi_turn=False, supports_system_prompt=True)
-    config = TargetConfiguration(capabilities=caps)
-    # RAISE policy: pipeline construction succeeds but no normalizer is added for multi_turn.
+    config = TargetConfiguration(
+        capabilities=caps,
+        policy=CapabilityHandlingPolicy(
+            behaviors={
+                CapabilityName.MULTI_TURN: UnsupportedCapabilityBehavior.RAISE,
+                CapabilityName.SYSTEM_PROMPT: UnsupportedCapabilityBehavior.RAISE,
+                CapabilityName.JSON_SCHEMA: UnsupportedCapabilityBehavior.RAISE,
+            }
+        ),
+    )
+    # RAISE policy: pipeline construction succeeds but no normalizer is added for missing capabilities.
     # Validation is deferred to ensure_can_handle().
     assert len(config.pipeline.normalizers) == 0
+
+
+def test_init_missing_json_schema_default_policy_adds_normalizer():
+    # Default policy adapts JSON_SCHEMA; a target lacking native support gets the JSON-schema normalizer.
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=True,
+        supports_system_prompt=True,
+    )
+    config = TargetConfiguration(capabilities=caps)
+    assert len(config.pipeline.normalizers) == 1
+    assert isinstance(config.pipeline.normalizers[0], JsonSchemaNormalizer)
+
+
+def test_init_supports_json_schema_no_normalizer():
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=True,
+        supports_system_prompt=True,
+        supports_json_schema=True,
+    )
+    config = TargetConfiguration(capabilities=caps)
+    assert config.pipeline.normalizers == ()
+
+
+async def test_pipeline_strips_json_schema_for_non_schema_target():
+    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
+    config = TargetConfiguration(capabilities=caps)
+
+    piece = MessagePiece(
+        role="user",
+        original_value="score this",
+        prompt_metadata={"json_schema": {"type": "object"}, "response_format": "json"},
+    )
+    result = await config.pipeline.normalize_async(messages=[Message(message_pieces=[piece])])
+
+    out_piece = result[0].message_pieces[0]
+    metadata = out_piece.prompt_metadata
+    assert "json_schema" not in metadata
+    assert metadata["response_format"] == "json"
+    # For a text piece, the JSON-schema normalizer also injects schema instructions
+    # into the prompt text so the model is still nudged toward conforming JSON output.
+    assert "### Response format" in out_piece.converted_value
+
+
+async def test_pipeline_keeps_json_schema_for_schema_target():
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_system_prompt=True,
+        supports_json_schema=True,
+    )
+    config = TargetConfiguration(capabilities=caps)
+
+    piece = MessagePiece(
+        role="user",
+        original_value="score this",
+        prompt_metadata={"json_schema": {"type": "object"}, "response_format": "json"},
+    )
+    result = await config.pipeline.normalize_async(messages=[Message(message_pieces=[piece])])
+
+    metadata = result[0].message_pieces[0].prompt_metadata
+    assert metadata["json_schema"] == {"type": "object"}
+
+
+def test_init_sparse_policy_missing_json_schema_no_normalizer():
+    # A custom policy's behaviors map is sparse: an omitted capability is treated
+    # as RAISE (it is NOT merged with the default ADAPT policy). So a policy that
+    # omits JSON_SCHEMA adds no strip normalizer, and construction does not raise.
+    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
+    policy = CapabilityHandlingPolicy(behaviors={CapabilityName.SYSTEM_PROMPT: UnsupportedCapabilityBehavior.RAISE})
+    config = TargetConfiguration(capabilities=caps, policy=policy)
+    assert config.pipeline.normalizers == ()
+
+
+def test_default_configuration_does_not_adapt_editable_history():
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=False,
+        supports_system_prompt=True,
+        supports_json_schema=True,
+    )
+    config = TargetConfiguration(capabilities=caps)
+
+    assert not config.pipeline.has_normalizer_for(capability=CapabilityName.EDITABLE_HISTORY)
+    with pytest.raises(ValueError, match="no handling policy"):
+        config.ensure_can_handle(capability=CapabilityName.EDITABLE_HISTORY)
+
+
+async def test_per_send_override_preserves_construction_overrides_with_sparse_policy(make_message):
+    construction_normalizer = MagicMock(spec=MessageListNormalizer)
+    construction_normalizer.normalize_async = AsyncMock(side_effect=lambda messages: messages)
+    per_send_normalizer = MagicMock(spec=MessageListNormalizer)
+    per_send_normalizer.normalize_async = AsyncMock(side_effect=lambda messages: messages)
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=False,
+        supports_system_prompt=False,
+        supports_json_schema=True,
+    )
+    sparse_policy = CapabilityHandlingPolicy(behaviors={})
+    config = TargetConfiguration(
+        capabilities=caps,
+        policy=sparse_policy,
+        normalizer_overrides={CapabilityName.SYSTEM_PROMPT: construction_normalizer},
+    )
+
+    await config.normalize_async(
+        messages=[make_message("user", "hello")],
+        normalizer_overrides={CapabilityName.EDITABLE_HISTORY: per_send_normalizer},
+    )
+
+    construction_normalizer.normalize_async.assert_awaited_once()
+    per_send_normalizer.normalize_async.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +263,6 @@ def test_ensure_can_handle_passes_when_adapt(adapt_all_policy):
 
 def test_ensure_can_handle_raises_when_raise_policy():
     # Build with ADAPT so construction succeeds, then test ensure_can_handle() on a RAISE capability.
-    # JSON_SCHEMA is RAISE and unsupported — but it's not normalizable, so construction
-    # doesn't try to build a normalizer for it. Use a custom policy where system_prompt
-    # is ADAPT (so pipeline builds), but then call ensure_can_handle() on JSON_OUTPUT which is RAISE.
     caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=False)
     policy = CapabilityHandlingPolicy(
         behaviors={
@@ -149,11 +280,52 @@ def test_ensure_can_handle_raises_when_raise_policy():
         config.ensure_can_handle(capability=CapabilityName.JSON_OUTPUT)
 
 
+def test_ensure_can_handle_raises_when_capability_missing_from_policy():
+    # A sparse policy that omits a capability the target lacks → ensure_can_handle rejects it.
+    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
+    policy = CapabilityHandlingPolicy(behaviors={CapabilityName.SYSTEM_PROMPT: UnsupportedCapabilityBehavior.RAISE})
+    config = TargetConfiguration(capabilities=caps, policy=policy)
+    with pytest.raises(ValueError, match="no handling policy"):
+        config.ensure_can_handle(capability=CapabilityName.JSON_SCHEMA)
+
+
+@pytest.mark.parametrize(
+    "behaviors",
+    [
+        {},
+        {CapabilityName.EDITABLE_HISTORY: UnsupportedCapabilityBehavior.RAISE},
+    ],
+)
+def test_ensure_can_handle_explicit_override_precedes_sparse_or_raise_policy(
+    behaviors: dict[CapabilityName, UnsupportedCapabilityBehavior],
+):
+    normalizer = MagicMock(spec=MessageListNormalizer)
+    config = TargetConfiguration(
+        capabilities=TargetCapabilities(supports_editable_history=False),
+        policy=CapabilityHandlingPolicy(behaviors=behaviors),
+        normalizer_overrides={CapabilityName.EDITABLE_HISTORY: normalizer},
+    )
+
+    config.ensure_can_handle(capability=CapabilityName.EDITABLE_HISTORY)
+
+
+def test_ensure_can_handle_adapt_requires_available_normalizer():
+    config = TargetConfiguration(
+        capabilities=TargetCapabilities(supports_editable_history=False),
+        policy=CapabilityHandlingPolicy(
+            behaviors={CapabilityName.EDITABLE_HISTORY: UnsupportedCapabilityBehavior.ADAPT}
+        ),
+    )
+
+    with pytest.raises(ValueError, match="no default or configured normalizer"):
+        config.ensure_can_handle(capability=CapabilityName.EDITABLE_HISTORY)
+
+
 def test_ensure_can_handle_raises_valueerror_for_non_normalizable_capability():
-    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True, supports_editable_history=False)
+    caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
     config = TargetConfiguration(capabilities=caps)
     with pytest.raises(ValueError, match="no handling policy"):
-        config.ensure_can_handle(capability=CapabilityName.EDITABLE_HISTORY)
+        config.ensure_can_handle(capability=CapabilityName.MULTI_MESSAGE_PIECES)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +333,6 @@ def test_ensure_can_handle_raises_valueerror_for_non_normalizable_capability():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_async_passthrough_when_all_supported(adapt_all_policy, make_message):
     caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=True)
     config = TargetConfiguration(capabilities=caps, policy=adapt_all_policy)
@@ -171,7 +342,6 @@ async def test_normalize_async_passthrough_when_all_supported(adapt_all_policy, 
     assert result[0].message_pieces[0].converted_value == "hello"
 
 
-@pytest.mark.asyncio
 async def test_normalize_async_adapts_system_prompt(adapt_all_policy, make_message):
     caps = TargetCapabilities(supports_multi_turn=True, supports_system_prompt=False)
     config = TargetConfiguration(capabilities=caps, policy=adapt_all_policy)
@@ -187,7 +357,6 @@ async def test_normalize_async_adapts_system_prompt(adapt_all_policy, make_messa
             assert piece.api_role != "system"
 
 
-@pytest.mark.asyncio
 async def test_normalize_async_adapts_multi_turn(adapt_all_policy, make_message):
     caps = TargetCapabilities(supports_multi_turn=False, supports_system_prompt=True)
     config = TargetConfiguration(capabilities=caps, policy=adapt_all_policy)
@@ -202,26 +371,6 @@ async def test_normalize_async_adapts_multi_turn(adapt_all_policy, make_message)
     assert len(result) == 1
     assert "[Conversation History]" in result[0].message_pieces[0].converted_value
     assert "turn 2" in result[0].message_pieces[0].converted_value
-
-
-def test_resolve_configuration_compat_raises_when_both_supplied():
-    caps = TargetCapabilities()
-    config = TargetConfiguration(capabilities=caps)
-    with pytest.raises(ValueError, match="Cannot specify both"):
-        resolve_configuration_compat(custom_configuration=config, custom_capabilities=caps)
-
-
-def test_resolve_configuration_compat_wraps_capabilities_with_warning():
-    caps = TargetCapabilities(supports_multi_turn=True)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        result = resolve_configuration_compat(custom_configuration=None, custom_capabilities=caps)
-
-    assert isinstance(result, TargetConfiguration)
-    assert result.capabilities.supports_multi_turn is True
-    deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert len(deprecation_warnings) == 1
-    assert "custom_capabilities" in str(deprecation_warnings[0].message)
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +390,8 @@ def test_capabilities_to_identifier_params_includes_all_fields():
 
     params = TargetConfiguration._capabilities_to_identifier_params(caps)
 
-    # Every dataclass field on TargetCapabilities must appear in the params.
-    assert set(params.keys()) == {f.name for f in fields(caps)}
+    # Every model field on TargetCapabilities must appear in the params.
+    assert set(params.keys()) == set(type(caps).model_fields)
 
 
 def test_capabilities_to_identifier_params_scalar_fields_passthrough():

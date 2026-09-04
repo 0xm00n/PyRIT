@@ -1,20 +1,31 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-import json
 import logging
 import struct
-from collections.abc import MutableSequence, Sequence
-from contextlib import closing, suppress
+import uuid
+from collections.abc import Mapping, Sequence
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from sqlalchemy import and_, create_engine, event, exists, text
+from sqlalchemy import (
+    Integer,
+    Unicode,
+    and_,
+    bindparam,
+    create_engine,
+    event,
+    exists,
+    func,
+    literal_column,
+    text,
+)
 from sqlalchemy.engine.base import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import InstrumentedAttribute, joinedload, sessionmaker
+from sqlalchemy.orm import InstrumentedAttribute, sessionmaker
 from sqlalchemy.orm.session import Session
-from sqlalchemy.sql.expression import TextClause
+from sqlalchemy.sql.expression import ColumnElement, TextClause
 
 from pyrit.auth.azure_auth import AzureAuth
 from pyrit.common import default_values
@@ -22,22 +33,17 @@ from pyrit.common.singleton import Singleton
 from pyrit.memory.memory_interface import MemoryInterface
 from pyrit.memory.memory_models import (
     AttackResultEntry,
-    Base,
-    EmbeddingDataEntry,
+    CustomUUID,
     PromptMemoryEntry,
+    ScenarioResultEntry,
 )
-from pyrit.models import (
-    AzureBlobStorageIO,
-    ConversationStats,
-    MessagePiece,
-)
+from pyrit.memory.storage import AzureBlobStorageIO
+from pyrit.models import ConversationStats
 
 if TYPE_CHECKING:
     from azure.core.credentials import AccessToken
 
 logger = logging.getLogger(__name__)
-
-Model = TypeVar("Model")
 
 
 class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
@@ -54,29 +60,39 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
     TOKEN_URL = "https://database.windows.net/.default"  # The token URL for any Azure SQL database
     AZURE_SQL_DB_CONNECTION_STRING = "AZURE_SQL_DB_CONNECTION_STRING"
 
+    # Azure SQL supports up to 2100 parameters per statement
+    _MAX_BIND_VARS: int = 2000
+
     # Azure Storage Account Container datasets and results environment variables
     AZURE_STORAGE_ACCOUNT_DB_DATA_CONTAINER_URL: str = "AZURE_STORAGE_ACCOUNT_DB_DATA_CONTAINER_URL"
     AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN: str = "AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN"
 
+    # Optional environment variable for production connection string to prevent accidental schema migrations on prod
+    AZURE_SQL_DB_CONNECTION_STRING_PROD: str = "AZURE_SQL_DB_CONNECTION_STRING_PROD"
+
     def __init__(
         self,
         *,
-        connection_string: Optional[str] = None,
-        results_container_url: Optional[str] = None,
-        results_sas_token: Optional[str] = None,
+        connection_string: str | None = None,
+        results_container_url: str | None = None,
+        results_sas_token: str | None = None,
         verbose: bool = False,
-    ):
+        skip_schema_migration: bool = False,
+        silent: bool = False,
+    ) -> None:
         """
         Initialize an Azure SQL Memory backend.
 
         Args:
-            connection_string (Optional[str]): The connection string for the Azure Sql Database. If not provided,
+            connection_string (str | None): The connection string for the Azure Sql Database. If not provided,
                 it falls back to the 'AZURE_SQL_DB_CONNECTION_STRING' environment variable.
-            results_container_url (Optional[str]): The URL to an Azure Storage Container. If not provided,
+            results_container_url (str | None): The URL to an Azure Storage Container. If not provided,
                 it falls back to the 'AZURE_STORAGE_ACCOUNT_DB_DATA_CONTAINER_URL' environment variable.
-            results_sas_token (Optional[str]): The Shared Access Signature (SAS) token for the storage container.
+            results_sas_token (str | None): The Shared Access Signature (SAS) token for the storage container.
                 If not provided, falls back to the 'AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN' environment variable.
             verbose (bool): Whether to enable verbose logging for the database engine. Defaults to False.
+            skip_schema_migration (bool): Whether to skip schema migration. Defaults to False.
+            silent (bool): If True, suppresses schema migration console output. Defaults to False.
         """
         self._connection_string = default_values.get_required_value(
             env_var_name=self.AZURE_SQL_DB_CONNECTION_STRING, passed_value=connection_string
@@ -86,12 +102,12 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             env_var_name=self.AZURE_STORAGE_ACCOUNT_DB_DATA_CONTAINER_URL, passed_value=results_container_url
         )
 
-        self._results_container_sas_token: Optional[str] = self._resolve_sas_token(
+        self._results_container_sas_token: str | None = self._resolve_sas_token(
             self.AZURE_STORAGE_ACCOUNT_DB_DATA_SAS_TOKEN, results_sas_token
         )
 
-        self._auth_token: Optional[AccessToken] = None
-        self._auth_token_expiry: Optional[int] = None
+        self._auth_token: AccessToken | None = None
+        self._auth_token_expiry: int | None = None
 
         self.results_path = self._results_container_url
 
@@ -103,24 +119,54 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         self._enable_azure_authorization()
 
         self.SessionFactory = sessionmaker(bind=self.engine)
-        self._create_tables_if_not_exist()
+
+        prod_connection_string = default_values.get_non_required_value(
+            env_var_name=self.AZURE_SQL_DB_CONNECTION_STRING_PROD
+        )
+
+        is_prod = bool(prod_connection_string) and self._connection_string == prod_connection_string
+        should_migrate = not is_prod and not skip_schema_migration
+
+        if should_migrate:
+            # Non-production: run schema migration (upgrade + check).
+            self._run_schema_migration(silent=silent)
+        else:
+            # Production or skip_schema_migration=True: verify schema compatibility
+            # without modifying the database. Logs a warning on mismatch but does not
+            # block startup, so developers on newer code can still query data.
+            from alembic.util.exc import AutogenerateDiffsDetected, CommandError
+
+            try:
+                self._check_schema_migration(silent=silent)
+            except (AutogenerateDiffsDetected, CommandError) as e:
+                logger.warning(
+                    "Schema mismatch detected. "
+                    "Your code models differ from the database schema. "
+                    "This may cause errors if your code references columns or tables that don't exist. "
+                    f"Schema was NOT modified. Details: {e}"
+                )
 
         super().__init__()
 
     @staticmethod
-    def _resolve_sas_token(env_var_name: str, passed_value: Optional[str] = None) -> Optional[str]:
+    def _resolve_sas_token(env_var_name: str, passed_value: str | None = None) -> str | None:
         """
         Resolve the SAS token value, allowing a fallback to None for delegation SAS.
 
         Args:
             env_var_name (str): The environment variable name to look up.
-            passed_value (Optional[str]): A passed-in value for the SAS token.
+            passed_value (str | None): A passed-in value for the SAS token.
 
         Returns:
-            Optional[str]: Resolved SAS token or None if not provided.
+            str | None: Resolved SAS token or None if not provided.
         """
         try:
-            return default_values.get_required_value(env_var_name=env_var_name, passed_value=passed_value)  # type: ignore[no-any-return]
+            value = default_values.get_required_value(env_var_name=env_var_name, passed_value=passed_value)
+            # get_required_value() is typed to return Any because it can also preserve callables
+            # (e.g. token providers). This call site only ever passes a str | None, so the
+            # runtime value is guaranteed to be a str.
+            resolved_value: str = value
+            return resolved_value
         except ValueError:
             return None
 
@@ -215,59 +261,50 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             # add the encoded token
             cparams["attrs_before"] = {self.SQL_COPT_SS_ACCESS_TOKEN: packed_azure_token}
 
-    def _create_tables_if_not_exist(self) -> None:
-        """
-        Create all tables defined in the Base metadata, if they don't already exist in the database.
-
-        Raises:
-            Exception: If there's an issue creating the tables in the database.
-            RuntimeError: If the engine is not initialized.
-        """
-        try:
-            # Using the 'checkfirst=True' parameter to avoid attempting to recreate existing tables
-            if self.engine is None:
-                raise RuntimeError("Engine is not initialized")
-            Base.metadata.create_all(self.engine, checkfirst=True)
-        except Exception as e:
-            logger.exception(f"Error during table creation: {e}")
-            raise
-
-    def _add_embeddings_to_memory(self, *, embedding_data: Sequence[EmbeddingDataEntry]) -> None:
-        """
-        Insert embedding data into memory storage.
-        """
-        self._insert_entries(entries=embedding_data)
-
-    def _get_message_pieces_memory_label_conditions(self, *, memory_labels: dict[str, str]) -> list[TextClause]:
+    def _get_message_pieces_memory_label_conditions(self, *, memory_labels: dict[str, str]) -> list[Any]:
         """
         Generate SQL conditions for filtering message pieces by memory labels.
 
         Uses JSON_VALUE() function specific to SQL Azure to query label fields in JSON format.
 
+        Matches labels on an AttackResultEntry that shares the same conversation_id.
+
         Args:
             memory_labels (dict[str, str]): Dictionary of label key-value pairs to filter by.
 
         Returns:
-            list: List containing a single SQLAlchemy text condition with bound parameters.
+            list: List containing a single SQLAlchemy OR condition with bound parameters.
         """
-        json_validation = "ISJSON(labels) = 1"
-        json_conditions = " AND ".join([f"JSON_VALUE(labels, '$.{key}') = :{key}" for key in memory_labels])
-        # Combine both conditions
-        conditions = f"{json_validation} AND {json_conditions}"
+        are_label_parts: list[str] = []
+        are_bindparams: dict[str, str] = {}
 
-        # Create SQL condition using SQLAlchemy's text() with bindparams
-        # for safe parameter passing, preventing SQL injection
-        condition = text(conditions).bindparams(**{key: str(value) for key, value in memory_labels.items()})
-        return [condition]
+        for key, value in memory_labels.items():
+            are_param = f"are_ml_{key}"
+            are_label_parts.append(f"JSON_VALUE(\"AttackResultEntries\".labels, '$.{key}') = :{are_param}")
+            are_bindparams[are_param] = str(value)
 
-    def _get_metadata_conditions(self, *, prompt_metadata: dict[str, Union[str, int]]) -> list[TextClause]:
+        combined_are = " AND ".join(are_label_parts)
+        are_match = exists().where(
+            and_(
+                AttackResultEntry.conversation_id == PromptMemoryEntry.conversation_id,
+                AttackResultEntry.labels.isnot(None),
+                cast(
+                    "ColumnElement[bool]",
+                    text(f'ISJSON("AttackResultEntries".labels) = 1 AND {combined_are}').bindparams(**are_bindparams),
+                ),
+            )
+        )
+
+        return [are_match]
+
+    def _get_metadata_conditions(self, *, prompt_metadata: dict[str, str | int]) -> list[TextClause]:
         """
         Generate SQL conditions for filtering by prompt metadata.
 
         Uses JSON_VALUE() function specific to SQL Azure to query metadata fields in JSON format.
 
         Args:
-            prompt_metadata (dict[str, Union[str, int]]): Dictionary of metadata key-value pairs to filter by.
+            prompt_metadata (dict[str, str | int]): Dictionary of metadata key-value pairs to filter by.
 
         Returns:
             list: List containing a single SQLAlchemy text condition with bound parameters.
@@ -285,7 +322,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         return [condition]
 
     def _get_message_pieces_prompt_metadata_conditions(
-        self, *, prompt_metadata: dict[str, Union[str, int]]
+        self, *, prompt_metadata: dict[str, str | int]
     ) -> list[TextClause]:
         """
         Generate SQL conditions for filtering message pieces by prompt metadata.
@@ -293,14 +330,14 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         This is a convenience wrapper around _get_metadata_conditions.
 
         Args:
-            prompt_metadata (dict[str, Union[str, int]]): Dictionary of metadata key-value pairs to filter by.
+            prompt_metadata (dict[str, str | int]): Dictionary of metadata key-value pairs to filter by.
 
         Returns:
             list: List containing SQLAlchemy text conditions with bound parameters.
         """
         return self._get_metadata_conditions(prompt_metadata=prompt_metadata)
 
-    def _get_seed_metadata_conditions(self, *, metadata: dict[str, Union[str, int]]) -> TextClause:
+    def _get_seed_metadata_conditions(self, *, metadata: dict[str, str | int]) -> TextClause:
         """
         Generate SQL condition for filtering seed prompts by metadata.
 
@@ -308,7 +345,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         the first (and only) condition.
 
         Args:
-            metadata (dict[str, Union[str, int]]): Dictionary of metadata key-value pairs to filter by.
+            metadata (dict[str, str | int]): Dictionary of metadata key-value pairs to filter by.
 
         Returns:
             Any: SQLAlchemy text condition with bound parameters.
@@ -331,7 +368,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             json_column (InstrumentedAttribute[Any]): The JSON-backed model field to query.
             property_path (str): The JSON path for the property to match.
             value (str): The string value that must match the extracted JSON property value.
-            partial_match (bool): Whether to perform a substring match.
+            partial_match (bool): Whether to perform a substring match. Defaults to False.
             case_sensitive (bool): Whether the match should be case-sensitive. Defaults to False.
 
         Returns:
@@ -370,6 +407,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         property_path: str,
         array_element_path: str | None = None,
         array_to_match: Sequence[str],
+        match_mode: Literal["all", "any"] = "all",
     ) -> Any:
         """
         Return an Azure SQL DB condition for matching an array at a given path within a JSON object.
@@ -377,10 +415,14 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         Args:
             json_column (InstrumentedAttribute[Any]): The JSON-backed SQLAlchemy field to query.
             property_path (str): The JSON path for the target array.
-            array_element_path (Optional[str]): An optional JSON path applied to each array item before matching.
+            array_element_path (str | None): An optional JSON path applied to each array item before matching.
             array_to_match (Sequence[str]): The array that must match the extracted JSON array values.
-                For a match, ALL values in this array must be present in the JSON array.
-                If `array_to_match` is empty, the condition matches only if the target is also an empty array or None.
+                Combination semantics for multiple entries are controlled by ``match_mode``.
+                If ``array_to_match`` is empty, the condition matches only if the target is also an
+                empty array or None (overloaded "absence" semantics, regardless of ``match_mode``).
+            match_mode (Literal["all", "any"]): How to combine multiple entries in ``array_to_match``.
+                ``"all"`` (default) requires every listed value to be present in the JSON array.
+                ``"any"`` requires at least one listed value to be present.
 
         Returns:
             Any: A database-specific SQLAlchemy condition.
@@ -414,75 +456,47 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             )
             bindparams_dict[mv_param] = match_value.lower()
 
-        combined = " AND ".join(conditions)
-        return text(f"""ISJSON("{table_name}".{column_name}) = 1 AND {combined}""").bindparams(**bindparams_dict)
+        joiner = " OR " if match_mode == "any" else " AND "
+        combined = joiner.join(conditions)
+        return text(f"""ISJSON("{table_name}".{column_name}) = 1 AND ({combined})""").bindparams(**bindparams_dict)
 
-    def _get_attack_result_harm_category_condition(self, *, targeted_harm_categories: Sequence[str]) -> Any:
+    def _get_attack_result_label_condition(self, *, labels: dict[str, str | Sequence[str]]) -> Any:
         """
-        Get the SQL Azure implementation for filtering AttackResults by targeted harm categories.
+        Azure SQL implementation for filtering AttackResults by labels.
 
-        Uses JSON_QUERY() function specific to SQL Azure to check if categories exist in the JSON array.
+        Matches labels directly on the AttackResultEntry.
 
-        Args:
-            targeted_harm_categories (Sequence[str]): List of harm category strings to filter by.
+        Uses JSON_VALUE() with parameterized IN clauses. See
+        ``MemoryInterface._get_attack_result_label_condition`` for semantics.
 
         Returns:
-            Any: SQLAlchemy exists subquery condition with bound parameters.
+            Any: SQLAlchemy condition with bound parameters.
         """
-        # For SQL Azure, we need to use JSON_QUERY to check if a value exists in a JSON array
-        # OPENJSON can parse the array and we check if the category exists
-        # Using parameterized queries for safety
-        harm_conditions = []
-        bindparams_dict = {}
-        for i, category in enumerate(targeted_harm_categories):
-            param_name = f"harm_cat_{i}"
-            # Check if the JSON array contains the category value
-            harm_conditions.append(
-                f"EXISTS(SELECT 1 FROM OPENJSON(targeted_harm_categories) WHERE value = :{param_name})"
+        are_label_conditions: list[str] = []
+        are_bindparams: dict[str, str] = {}
+
+        for key, raw_value in labels.items():
+            values = [raw_value] if isinstance(raw_value, str) else list(raw_value)
+            if not values:
+                continue
+            are_placeholders = []
+            for idx, v in enumerate(values):
+                are_param = f"are_label_{key}_{idx}"
+                are_placeholders.append(f":{are_param}")
+                are_bindparams[are_param] = str(v)
+            are_in = ", ".join(are_placeholders)
+            are_label_conditions.append(f"JSON_VALUE(\"AttackResultEntries\".labels, '$.{key}') IN ({are_in})")
+
+        are_parts: list[Any] = [AttackResultEntry.labels.isnot(None)]
+        if are_label_conditions:
+            combined_are = " AND ".join(are_label_conditions)
+            are_parts.append(
+                cast(
+                    "ColumnElement[bool]",
+                    text(f'ISJSON("AttackResultEntries".labels) = 1 AND {combined_are}').bindparams(**are_bindparams),
+                )
             )
-            bindparams_dict[param_name] = category
-
-        combined_conditions = " AND ".join(harm_conditions)
-
-        return exists().where(
-            and_(
-                PromptMemoryEntry.conversation_id == AttackResultEntry.conversation_id,
-                PromptMemoryEntry.targeted_harm_categories.isnot(None),
-                PromptMemoryEntry.targeted_harm_categories != "",
-                PromptMemoryEntry.targeted_harm_categories != "[]",
-                text(f"ISJSON(targeted_harm_categories) = 1 AND {combined_conditions}").bindparams(**bindparams_dict),
-            )
-        )
-
-    def _get_attack_result_label_condition(self, *, labels: dict[str, str]) -> Any:
-        """
-        Get the SQL Azure implementation for filtering AttackResults by labels.
-
-        Uses JSON_VALUE() function specific to SQL Azure with parameterized queries.
-
-        Args:
-            labels (dict[str, str]): Dictionary of label key-value pairs to filter by.
-
-        Returns:
-            Any: SQLAlchemy exists subquery condition with bound parameters.
-        """
-        # Build JSON conditions for all labels with parameterized queries
-        label_conditions = []
-        bindparams_dict = {}
-        for key, value in labels.items():
-            param_name = f"label_{key}"
-            label_conditions.append(f"JSON_VALUE(labels, '$.{key}') = :{param_name}")
-            bindparams_dict[param_name] = str(value)
-
-        combined_conditions = " AND ".join(label_conditions)
-
-        return exists().where(
-            and_(
-                PromptMemoryEntry.conversation_id == AttackResultEntry.conversation_id,
-                PromptMemoryEntry.labels.isnot(None),
-                text(f"ISJSON(labels) = 1 AND {combined_conditions}").bindparams(**bindparams_dict),
-            )
-        )
+        return and_(*are_parts)
 
     def get_unique_attack_class_names(self) -> list[str]:
         """
@@ -532,8 +546,8 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         Azure SQL implementation: lightweight aggregate stats per conversation.
 
         Executes a single SQL query that returns message count (distinct
-        sequences), a truncated last-message preview, the first non-empty
-        labels dict, and the earliest timestamp for each conversation_id.
+        sequences), a truncated last-message preview, and the earliest
+        timestamp for each conversation_id.
 
         Args:
             conversation_ids (Sequence[str]): The conversation IDs to query.
@@ -547,27 +561,23 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         placeholders = ", ".join(f":cid{i}" for i in range(len(conversation_ids)))
         params = {f"cid{i}": cid for i, cid in enumerate(conversation_ids)}
 
-        max_len = ConversationStats.PREVIEW_MAX_LEN
         sql = text(
             f"""
             SELECT
                 pme.conversation_id,
                 COUNT(DISTINCT pme.sequence) AS msg_count,
                 (
-                    SELECT TOP 1 LEFT(p2.converted_value, {max_len + 3})
+                    SELECT TOP 1 LEFT(p2.converted_value, {ConversationStats.PREVIEW_FETCH_MAX_LEN})
                     FROM "PromptMemoryEntries" p2
                     WHERE p2.conversation_id = pme.conversation_id
                     ORDER BY p2.sequence DESC, p2.id DESC
                 ) AS last_preview,
                 (
-                    SELECT TOP 1 p3.labels
-                    FROM "PromptMemoryEntries" p3
-                    WHERE p3.conversation_id = pme.conversation_id
-                      AND p3.labels IS NOT NULL
-                      AND p3.labels != '{{}}'
-                      AND p3.labels != 'null'
-                    ORDER BY p3.sequence ASC, p3.id ASC
-                ) AS first_labels,
+                    SELECT TOP 1 p2b.converted_value_data_type
+                    FROM "PromptMemoryEntries" p2b
+                    WHERE p2b.conversation_id = pme.conversation_id
+                    ORDER BY p2b.sequence DESC, p2b.id DESC
+                ) AS last_data_type,
                 MIN(pme.timestamp) AS created_at
             FROM "PromptMemoryEntries" pme
             WHERE pme.conversation_id IN ({placeholders})
@@ -580,16 +590,7 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
 
         result: dict[str, ConversationStats] = {}
         for row in rows:
-            conv_id, msg_count, last_preview, raw_labels, raw_created_at = row
-
-            preview = None
-            if last_preview:
-                preview = last_preview[:max_len] + "..." if len(last_preview) > max_len else last_preview
-
-            labels: dict[str, str] = {}
-            if raw_labels and raw_labels not in ("null", "{}"):
-                with suppress(ValueError, TypeError):
-                    labels = json.loads(raw_labels)
+            conv_id, msg_count, last_preview, last_data_type, raw_created_at = row
 
             created_at = None
             if raw_created_at is not None:
@@ -600,14 +601,14 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
 
             result[conv_id] = ConversationStats(
                 message_count=msg_count,
-                last_message_preview=preview,
-                labels=labels,
+                last_message_preview=last_preview,
+                last_message_data_type=last_data_type,
                 created_at=created_at,
             )
 
         return result
 
-    def _get_scenario_result_label_condition(self, *, labels: dict[str, str]) -> Any:
+    def _get_scenario_result_label_condition(self, *, labels: Mapping[str, str | Sequence[str]]) -> Any:
         """
         Get the SQL Azure implementation for filtering ScenarioResults by labels.
 
@@ -621,88 +622,192 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
         """
         # Return combined conditions for all labels
         conditions = []
-        for key, value in labels.items():
-            condition = text(f"ISJSON(labels) = 1 AND JSON_VALUE(labels, '$.{key}') = :{key}").bindparams(
-                **{key: str(value)}
-            )
-            conditions.append(condition)
+        for key_index, (key, raw_value) in enumerate(labels.items()):
+            values = [raw_value] if isinstance(raw_value, str) else list(raw_value)
+            placeholders = []
+            path_param = f"scenario_label_path_{key_index}"
+            bindparams: dict[str, str] = {path_param: f'$."{key}"'}
+            for index, value in enumerate(values):
+                param = f"scenario_label_value_{key_index}_{index}"
+                placeholders.append(f":{param}")
+                bindparams[param] = str(value)
+            if placeholders:
+                conditions.append(
+                    text(
+                        f"ISJSON(labels) = 1 AND JSON_VALUE(labels, :{path_param}) IN ({', '.join(placeholders)})"
+                    ).bindparams(**bindparams)
+                )
         return and_(*conditions)
 
-    def add_message_pieces_to_memory(self, *, message_pieces: Sequence[MessagePiece]) -> None:
+    def _get_scenario_registry_name_condition(self, *, scenario_names: Sequence[str]) -> Any:
         """
-        Insert a list of message pieces into the memory storage.
-
-        Args:
-            message_pieces (Sequence[MessagePiece]): A sequence of MessagePiece instances to be added.
-        """
-        self._insert_entries(entries=[PromptMemoryEntry(entry=piece) for piece in message_pieces])
-
-    def dispose_engine(self) -> None:
-        """
-        Dispose the engine and clean up resources.
-        """
-        if self.engine:
-            self.engine.dispose()
-            # During interpreter shutdown, logging handler streams may already be closed,
-            # causing the framework to print "Logging error" to stderr (GH-1520).
-            # Temporarily suppress logging errors for this teardown message.
-            previous_raise = logging.raiseExceptions
-            logging.raiseExceptions = False
-            try:
-                logger.info("Engine disposed successfully.")
-            finally:
-                logging.raiseExceptions = previous_raise
-
-    def get_all_embeddings(self) -> Sequence[EmbeddingDataEntry]:
-        """
-        Fetch all entries from the specified table and returns them as model instances.
+        Match requested scenario registry names inside the persisted run plan.
 
         Returns:
-            Sequence[EmbeddingDataEntry]: A sequence of EmbeddingDataEntry instances representing all stored embeddings.
+            Any: SQL Server JSON condition for the requested names.
         """
-        result: Sequence[EmbeddingDataEntry] = self._query_entries(EmbeddingDataEntry)
-        return result
+        placeholders = []
+        bindparams: dict[str, str] = {}
+        for index, value in enumerate(scenario_names):
+            param = f"scenario_registry_name_{index}"
+            placeholders.append(f":{param}")
+            bindparams[param] = value
+        return text(
+            "ISJSON(scenario_metadata) = 1 AND "
+            "JSON_VALUE(scenario_metadata, '$.run_plan.scenario_registry_name') "
+            f"IN ({', '.join(placeholders)})"
+        ).bindparams(**bindparams)
 
-    def _insert_entry(self, entry: Base) -> None:
-        """
-        Insert an entry into the Table.
+    def _get_scenario_history_plan_expressions(self) -> tuple[Any, Any, Any]:
+        """Return compact SQL Server run-plan fields without objective-bearing seed groups."""
+        return (
+            func.json_value(
+                ScenarioResultEntry.scenario_metadata,
+                "$.run_plan.scenario_registry_name",
+            ),
+            func.json_query(
+                ScenarioResultEntry.scenario_metadata,
+                "$.run_plan.atomic_groups",
+            ),
+            func.isnull(
+                literal_column(
+                    """
+                    (
+                        SELECT
+                            JSON_VALUE(
+                                CASE
+                                    WHEN ISJSON([history_seed].[value]) = 1 THEN [history_seed].[value]
+                                    ELSE N'{}'
+                                END,
+                                '$.id'
+                            ) AS [id],
+                            JSON_VALUE(
+                                CASE
+                                    WHEN ISJSON([history_seed].[value]) = 1 THEN [history_seed].[value]
+                                    ELSE N'{}'
+                                END,
+                                '$.objective_sha256'
+                            ) AS [objective_sha256]
+                        FROM OPENJSON(
+                            COALESCE(
+                                JSON_QUERY(
+                                    [ScenarioResultEntries].[scenario_metadata],
+                                    '$.run_plan.seed_groups'
+                                ),
+                                N'[]'
+                            )
+                        ) AS [history_seed]
+                        FOR JSON PATH, INCLUDE_NULL_VALUES
+                    )
+                    """
+                ),
+                literal_column("'[]'"),
+            ),
+        )
 
-        Args:
-            entry: An instance of a SQLAlchemy model to be added to the Table.
+    def _get_scenario_attempt_unit_expressions(self) -> tuple[Any, Any, Any]:
+        """Return SQL Server JSON expressions for persisted scenario attempt attribution."""
+        atomic_name = func.coalesce(
+            func.json_value(AttackResultEntry.attribution_data, '$."parent_collection"'),
+            "",
+        )
+        technique_hash = func.coalesce(
+            func.json_value(AttackResultEntry.attribution_data, '$."parent_eval_hash"'),
+            "",
+        )
+        seed_group_id = func.coalesce(
+            func.json_value(AttackResultEntry.attribution_data, '$."seed_group_id"'),
+            AttackResultEntry.objective_sha256,
+            "",
+        )
+        return atomic_name, technique_hash, seed_group_id
 
-        Raises:
-            SQLAlchemyError: If the insertion fails.
-        """
-        with closing(self.get_session()) as session:
-            try:
-                session.add(entry)
-                session.commit()
-            except SQLAlchemyError as e:
-                session.rollback()
-                logger.exception(f"Error inserting entry into the table: {e}")
-                raise
-
-    # The following methods are not part of MemoryInterface, but seem
-    # common between SQLAlchemy-based implementations, regardless of engine.
-    # Perhaps we should find a way to refactor
-    def _insert_entries(self, *, entries: Sequence[Base]) -> None:
-        """
-        Insert multiple entries into the database.
-
-        Args:
-            entries (Sequence[Base]): A sequence of SQLAlchemy model instances to insert.
-
-        Raises:
-            SQLAlchemyError: If the insertion fails.
-        """
-        with closing(self.get_session()) as session:
-            try:
-                session.add_all(entries)
-                session.commit()
-            except SQLAlchemyError as e:
-                session.rollback()
-                logger.exception(f"Error inserting multiple entries into the table: {e}")
-                raise
+    def _get_scenario_plan_unit_subqueries(self, *, scenario_result_ids: Sequence[uuid.UUID]) -> tuple[Any, Any]:
+        """Return SQL Server run-plan expansions for planned units and planned seed groups."""
+        scenario_ids = bindparam(
+            "history_plan_scenario_ids",
+            value=list(scenario_result_ids),
+            expanding=True,
+            type_=CustomUUID(),
+        )
+        planned_units = (
+            text(
+                """
+                SELECT
+                    [plan_scenario].[id] AS [scenario_result_id],
+                    CAST([plan_group].[key] AS INT) AS [group_ordinal],
+                    JSON_VALUE([plan_group_json].[value], '$.id') AS [atomic_group_id],
+                    JSON_VALUE([plan_group_json].[value], '$.atomic_attack_name') AS [atomic_attack_name],
+                    JSON_VALUE([plan_group_json].[value], '$.technique_eval_hash') AS [technique_eval_hash],
+                    [plan_group_seed].[value] AS [seed_group_id]
+                FROM [ScenarioResultEntries] AS [plan_scenario]
+                CROSS APPLY OPENJSON(
+                    COALESCE(
+                        JSON_QUERY(
+                            [plan_scenario].[scenario_metadata],
+                            '$.run_plan.atomic_groups'
+                        ),
+                        N'[]'
+                    )
+                ) AS [plan_group]
+                CROSS APPLY (
+                    SELECT CASE
+                        WHEN ISJSON([plan_group].[value]) = 1 THEN [plan_group].[value]
+                        ELSE N'{}'
+                    END AS [value]
+                ) AS [plan_group_json]
+                CROSS APPLY OPENJSON([plan_group_json].[value], '$.seed_group_ids') AS [plan_group_seed]
+                WHERE ISJSON([plan_scenario].[scenario_metadata]) = 1
+                    AND [plan_scenario].[id] IN :history_plan_scenario_ids
+                """
+            )
+            .bindparams(scenario_ids)
+            .columns(
+                scenario_result_id=CustomUUID(),
+                group_ordinal=Integer(),
+                atomic_group_id=Unicode(),
+                atomic_attack_name=Unicode(),
+                technique_eval_hash=Unicode(),
+                seed_group_id=Unicode(),
+            )
+            .subquery("plan_units")
+        )
+        plan_seeds = (
+            text(
+                """
+                SELECT
+                    [plan_scenario].[id] AS [scenario_result_id],
+                    JSON_VALUE([plan_seed_json].[value], '$.id') AS [seed_group_id],
+                    JSON_VALUE([plan_seed_json].[value], '$.objective_sha256') AS [objective_sha256]
+                FROM [ScenarioResultEntries] AS [plan_scenario]
+                CROSS APPLY OPENJSON(
+                    COALESCE(
+                        JSON_QUERY(
+                            [plan_scenario].[scenario_metadata],
+                            '$.run_plan.seed_groups'
+                        ),
+                        N'[]'
+                    )
+                ) AS [plan_seed]
+                CROSS APPLY (
+                    SELECT CASE
+                        WHEN ISJSON([plan_seed].[value]) = 1 THEN [plan_seed].[value]
+                        ELSE N'{}'
+                    END AS [value]
+                ) AS [plan_seed_json]
+                WHERE ISJSON([plan_scenario].[scenario_metadata]) = 1
+                    AND [plan_scenario].[id] IN :history_plan_scenario_ids
+                """
+            )
+            .bindparams(scenario_ids)
+            .columns(
+                scenario_result_id=CustomUUID(),
+                seed_group_id=Unicode(),
+                objective_sha256=Unicode(),
+            )
+            .subquery("plan_seeds")
+        )
+        return planned_units, plan_seeds
 
     def get_session(self) -> Session:
         """
@@ -712,104 +817,3 @@ class AzureSQLMemory(MemoryInterface, metaclass=Singleton):
             Session: A new SQLAlchemy session bound to the configured engine.
         """
         return self.SessionFactory()
-
-    def _query_entries(
-        self,
-        model_class: type[Model],
-        *,
-        conditions: Optional[Any] = None,
-        distinct: bool = False,
-        join_scores: bool = False,
-    ) -> MutableSequence[Model]:
-        """
-        Fetch data from the specified table model with optional conditions.
-
-        Args:
-            model_class: The SQLAlchemy model class to query.
-            conditions: SQLAlchemy filter conditions (Optional).
-            distinct: Flag to return distinct rows (defaults to False).
-            join_scores: Flag to join the scores table with entries (defaults to False).
-
-        Returns:
-            List of model instances representing the rows fetched from the table.
-
-        Raises:
-            SQLAlchemyError: If the query fails.
-        """
-        with closing(self.get_session()) as session:
-            try:
-                query = session.query(model_class)
-                if join_scores and model_class == PromptMemoryEntry:
-                    query = query.options(joinedload(PromptMemoryEntry.scores))
-                elif model_class == AttackResultEntry:
-                    query = query.options(
-                        joinedload(AttackResultEntry.last_response).joinedload(PromptMemoryEntry.scores),
-                        joinedload(AttackResultEntry.last_score),
-                    )
-                if conditions is not None:
-                    query = query.filter(conditions)
-                if distinct:
-                    return query.distinct().all()
-                return query.all()
-            except SQLAlchemyError as e:
-                logger.exception(f"Error fetching data from table {model_class.__tablename__}: {e}")  # type: ignore[attr-defined]
-                raise
-
-    def _update_entries(self, *, entries: MutableSequence[Base], update_fields: dict[str, Any]) -> bool:
-        """
-        Update the given entries with the specified field values.
-
-        Args:
-            entries (Sequence[Base]): A list of SQLAlchemy model instances to be updated.
-            update_fields (dict): A dictionary of field names and their new values.
-
-        Returns:
-            bool: True if the update was successful, False otherwise.
-
-        Raises:
-            ValueError: If 'update_fields' is empty.
-            SQLAlchemyError: If the update fails.
-        """
-        if not update_fields:
-            raise ValueError("update_fields must be provided to update prompt entries.")
-        with closing(self.get_session()) as session:
-            try:
-                for entry in entries:
-                    # Load a fresh copy by primary key so we only touch the
-                    # requested fields.  Using merge() would copy ALL
-                    # attributes from the (potentially stale) detached object
-                    # and silently overwrite concurrent updates to columns
-                    # that are NOT in update_fields.
-                    entry_in_session = session.get(type(entry), entry.id)  # type: ignore[attr-defined]
-                    if entry_in_session is None:
-                        entry_in_session = session.merge(entry)
-                    for field, value in update_fields.items():
-                        if field in vars(entry_in_session):
-                            setattr(entry_in_session, field, value)
-                        else:
-                            session.rollback()
-                            raise ValueError(
-                                f"Field '{field}' does not exist in the table \
-                                            '{entry_in_session.__tablename__}'. Rolling back changes..."
-                            )
-                session.commit()
-                return True
-            except SQLAlchemyError as e:
-                session.rollback()
-                logger.exception(f"Error updating entries: {e}")
-                raise
-
-    def reset_database(self) -> None:
-        """
-        Drop and recreate existing tables.
-
-        Raises:
-            RuntimeError: If the engine is not initialized.
-        """
-        # Drop all existing tables
-        if self.engine is None:
-            raise RuntimeError("Engine is not initialized")
-
-        Base.metadata.drop_all(self.engine)
-        # Recreate the tables
-        Base.metadata.create_all(self.engine, checkfirst=True)

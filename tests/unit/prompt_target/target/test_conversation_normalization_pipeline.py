@@ -152,12 +152,33 @@ def test_from_capabilities_uses_override_normalizer():
     assert pipeline.normalizers[0] is mock_normalizer
 
 
+def test_explicit_editable_history_override_works_with_sparse_raise_policy():
+    mock_normalizer = MagicMock(spec=MessageListNormalizer)
+    caps = TargetCapabilities(
+        supports_multi_turn=True,
+        supports_editable_history=False,
+        supports_system_prompt=True,
+        supports_json_schema=True,
+    )
+    sparse_policy = CapabilityHandlingPolicy(
+        behaviors={CapabilityName.SYSTEM_PROMPT: UnsupportedCapabilityBehavior.RAISE}
+    )
+
+    pipeline = ConversationNormalizationPipeline.from_capabilities(
+        capabilities=caps,
+        policy=sparse_policy,
+        normalizer_overrides={CapabilityName.EDITABLE_HISTORY: mock_normalizer},
+    )
+
+    assert pipeline.normalizers == (mock_normalizer,)
+    assert pipeline.has_normalizer_for(capability=CapabilityName.EDITABLE_HISTORY)
+
+
 # ---------------------------------------------------------------------------
 # normalize_async — pass-through
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_passthrough_when_empty_pipeline(make_message):
     pipeline = ConversationNormalizationPipeline()
     messages = [make_message("system", "sys"), make_message("user", "hi")]
@@ -173,7 +194,6 @@ async def test_normalize_passthrough_when_empty_pipeline(make_message):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_adapts_system_prompt(make_message):
     caps = TargetCapabilities(supports_system_prompt=False, supports_multi_turn=True)
     policy = CapabilityHandlingPolicy(
@@ -200,7 +220,6 @@ async def test_normalize_adapts_system_prompt(make_message):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_adapts_multi_turn(make_message):
     caps = TargetCapabilities(supports_system_prompt=True, supports_multi_turn=False)
     policy = CapabilityHandlingPolicy(
@@ -233,7 +252,6 @@ async def test_normalize_adapts_multi_turn(make_message):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_adapts_system_then_multi_turn(adapt_all_policy, make_message):
     """System squash runs first, then history squash."""
     caps = TargetCapabilities(supports_system_prompt=False, supports_multi_turn=False)
@@ -259,7 +277,6 @@ async def test_normalize_adapts_system_then_multi_turn(adapt_all_policy, make_me
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 async def test_normalize_uses_custom_normalizer(make_message):
     mock_normalizer = MagicMock(spec=MessageListNormalizer)
     expected = [make_message("user", "custom")]

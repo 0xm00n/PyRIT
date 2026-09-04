@@ -9,7 +9,7 @@ This is the attack-centric API design.
 """
 
 import logging
-from typing import Literal, Optional
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query, status
 
@@ -31,6 +31,7 @@ from pyrit.backend.models.attacks import (
     UpdateMainConversationResponse,
 )
 from pyrit.backend.models.common import ProblemDetail
+from pyrit.backend.routes.common import parse_label_query_params
 from pyrit.backend.services.attack_service import get_attack_service
 
 logger = logging.getLogger(__name__)
@@ -38,44 +39,56 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/attacks", tags=["attacks"])
 
 
-def _parse_labels(label_params: Optional[list[str]]) -> Optional[dict[str, str]]:
-    """
-    Parse label query params in 'key:value' format to a dict.
-
-    Returns:
-        Dict mapping label keys to values, or None if no valid labels.
-    """
-    if not label_params:
-        return None
-    labels = {}
-    for param in label_params:
-        if ":" in param:
-            key, value = param.split(":", 1)
-            labels[key.strip()] = value.strip()
-    return labels if labels else None
-
-
 @router.get(
     "",
     response_model=AttackListResponse,
 )
-async def list_attacks(
-    attack_type: Optional[str] = Query(None, description="Filter by exact attack type name"),
-    converter_types: Optional[list[str]] = Query(
+async def list_attacks(  # pyrit-async-suffix-exempt
+    attack_types: list[str] | None = Query(
         None,
-        description="Filter by converter type names (repeatable, AND logic). "
-        "Omit to return all attacks regardless of converters. "
-        "Pass with no values to match only no-converter attacks.",
+        description="Filter by attack type names. May be specified multiple times to OR-match "
+        "across types (e.g. ?attack_types=A&attack_types=B). Case-insensitive. "
+        "Omit to return all attacks regardless of type.",
     ),
-    outcome: Optional[Literal["undetermined", "success", "failure"]] = Query(None, description="Filter by outcome"),
-    label: Optional[list[str]] = Query(None, description="Filter by labels (format: key:value, repeatable)"),
-    min_turns: Optional[int] = Query(None, ge=0, description="Filter by minimum executed turns"),
-    max_turns: Optional[int] = Query(None, ge=0, description="Filter by maximum executed turns"),
-    limit: int = Query(20, ge=1, le=100, description="Maximum items per page"),
-    cursor: Optional[str] = Query(
+    converter_types: list[str] | None = Query(
         None,
-        description="Pagination cursor: the attack_result_id of the last item from the previous page. "
-        "Omit to start from the beginning. The response includes next_cursor for the next page.",
+        description="Filter by converter type names. May be specified multiple times; "
+        "combination semantics are controlled by converter_types_match "
+        "(e.g. ?converter_types=A&converter_types=B). "
+        "Omit (or pass an empty value) to apply no converter filter. "
+        "To restrict to attacks with no converters, use has_converters=false.",
+    ),
+    converter_types_match: Literal["any", "all"] = Query(
+        "all",
+        description="How to combine multiple converter_types: 'any' (attack has at least one) "
+        "or 'all' (attack has every one). Defaults to 'all'.",
+    ),
+    has_converters: bool | None = Query(
+        None,
+        description="Filter by converter presence. true = attacks with at least one converter; "
+        "false = attacks with no converters. Omit for no filter.",
+    ),
+    include_scenario_attacks: bool = Query(
+        True,
+        description="Include attacks created as part of scenario runs. Defaults to true.",
+    ),
+    outcome: Literal["undetermined", "success", "failure", "error"] | None = Query(
+        None, description="Filter by outcome"
+    ),
+    label: list[str] | None = Query(
+        None,
+        description="Filter by labels (format: key:value). May be specified multiple times; "
+        "OR-matched within a key, AND-matched across keys "
+        "(e.g. ?label=op:red&label=op:blue matches op=red OR op=blue).",
+    ),
+    min_turns: int | None = Query(None, ge=0, description="Filter by minimum executed turns"),
+    max_turns: int | None = Query(None, ge=0, description="Filter by maximum executed turns"),
+    limit: int = Query(20, ge=1, le=100, description="Maximum items per page"),
+    cursor: str | None = Query(
+        None,
+        description="Opaque pagination cursor returned as next_cursor by the previous page. "
+        "Treat it as opaque and pass it back unmodified. "
+        "Omit to start from the beginning; the response includes next_cursor for the next page.",
     ),
 ) -> AttackListResponse:
     """
@@ -88,13 +101,20 @@ async def list_attacks(
         AttackListResponse: Paginated list of attack summaries.
     """
     service = get_attack_service()
-    labels = _parse_labels(label)
-    # Normalize converter_types: strip empty strings so ?converter_types= means "no converters"
+    labels = parse_label_query_params(label)
+    # Strip empty strings from the list-valued query params. The service layer
+    # coerces an all-empty ``converter_types`` list to None ("no filter"); the
+    # "attacks with no converters" case is expressed through ``has_converters``.
     if converter_types is not None:
         converter_types = [c for c in converter_types if c]
+    if attack_types is not None:
+        attack_types = [a for a in attack_types if a]
     return await service.list_attacks_async(
-        attack_type=attack_type,
+        attack_types=attack_types,
         converter_types=converter_types,
+        converter_types_match=converter_types_match,
+        has_converters=has_converters,
+        include_scenario_attacks=include_scenario_attacks,
         outcome=outcome,
         labels=labels,
         min_turns=min_turns,
@@ -108,7 +128,7 @@ async def list_attacks(
     "/attack-options",
     response_model=AttackOptionsResponse,
 )
-async def get_attack_options() -> AttackOptionsResponse:
+async def get_attack_options() -> AttackOptionsResponse:  # pyrit-async-suffix-exempt
     """
     Get unique attack type names used across all attacks.
 
@@ -127,7 +147,7 @@ async def get_attack_options() -> AttackOptionsResponse:
     "/converter-options",
     response_model=ConverterOptionsResponse,
 )
-async def get_converter_options() -> ConverterOptionsResponse:
+async def get_converter_options() -> ConverterOptionsResponse:  # pyrit-async-suffix-exempt
     """
     Get unique converter type names used across all attacks.
 
@@ -152,7 +172,7 @@ async def get_converter_options() -> ConverterOptionsResponse:
         422: {"model": ProblemDetail, "description": "Validation error"},
     },
 )
-async def create_attack(request: CreateAttackRequest) -> CreateAttackResponse:
+async def create_attack(request: CreateAttackRequest) -> CreateAttackResponse:  # pyrit-async-suffix-exempt
     """
     Create a new attack.
 
@@ -180,7 +200,7 @@ async def create_attack(request: CreateAttackRequest) -> CreateAttackResponse:
         404: {"model": ProblemDetail, "description": "Attack not found"},
     },
 )
-async def get_attack(attack_result_id: str) -> AttackSummary:
+async def get_attack(attack_result_id: str) -> AttackSummary:  # pyrit-async-suffix-exempt
     """
     Get attack details.
 
@@ -208,7 +228,7 @@ async def get_attack(attack_result_id: str) -> AttackSummary:
         404: {"model": ProblemDetail, "description": "Attack not found"},
     },
 )
-async def update_attack(
+async def update_attack(  # pyrit-async-suffix-exempt
     attack_result_id: str,
     request: UpdateAttackRequest,
 ) -> AttackSummary:
@@ -240,7 +260,7 @@ async def update_attack(
         404: {"model": ProblemDetail, "description": "Attack or conversation not found"},
     },
 )
-async def get_conversation_messages(
+async def get_conversation_messages(  # pyrit-async-suffix-exempt
     attack_result_id: str,
     conversation_id: str = Query(..., description="The conversation_id whose messages to return"),
 ) -> ConversationMessagesResponse:
@@ -281,7 +301,7 @@ async def get_conversation_messages(
         404: {"model": ProblemDetail, "description": "Attack not found"},
     },
 )
-async def get_conversations(attack_result_id: str) -> AttackConversationsResponse:
+async def get_conversations(attack_result_id: str) -> AttackConversationsResponse:  # pyrit-async-suffix-exempt
     """
     Get all conversations belonging to an attack.
 
@@ -312,7 +332,7 @@ async def get_conversations(attack_result_id: str) -> AttackConversationsRespons
         400: {"model": ProblemDetail, "description": "Invalid request"},
     },
 )
-async def create_related_conversation(
+async def create_related_conversation(  # pyrit-async-suffix-exempt
     attack_result_id: str,
     request: CreateConversationRequest,
 ) -> CreateConversationResponse:
@@ -355,7 +375,7 @@ async def create_related_conversation(
         400: {"model": ProblemDetail, "description": "Invalid conversation"},
     },
 )
-async def update_main_conversation(
+async def update_main_conversation(  # pyrit-async-suffix-exempt
     attack_result_id: str,
     request: UpdateMainConversationRequest,
 ) -> UpdateMainConversationResponse:
@@ -398,7 +418,7 @@ async def update_main_conversation(
         400: {"model": ProblemDetail, "description": "Message send failed"},
     },
 )
-async def add_message(
+async def add_message(  # pyrit-async-suffix-exempt
     attack_result_id: str,
     request: AddMessageRequest,
 ) -> AddMessageResponse:
@@ -409,10 +429,10 @@ async def add_message(
     If send=False, just stores the message in memory without sending (useful for
     system messages, context injection, or replaying assistant responses).
 
-    Converters can be specified at three levels (in priority order):
-    1. request.converter_ids - per-message converter instances
-    2. request.converters - inline converter definitions
-    3. attack.converter_ids - attack-level defaults
+    Request and response converters can be supplied as ordered, registry-backed
+    configurations. Each configuration can target message piece indexes, prompt
+    data types, or both. The global ``converter_ids`` request pipeline remains
+    available for compatibility but is deprecated.
 
     Returns:
         AddMessageResponse: Updated attack with new message(s).

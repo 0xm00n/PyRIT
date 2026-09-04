@@ -7,9 +7,8 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.18.1
 # ---
-
 # %% [markdown]
-# # 10.3 WebSocket Copilot Target
+# # WebSocket Copilot Target
 #
 # The `WebSocketCopilotTarget` is an alternative to the `PlaywrightCopilotTarget` that is designed to be more reliable by minimizing dependence on browser automation. Instead of driving the Copilot UI, it communicates directly with Copilot over a WebSocket connection.
 #
@@ -26,7 +25,8 @@
 
 # %%
 # type: ignore
-from pyrit.executor.attack import ConsoleAttackResultPrinter, PromptSendingAttack
+from pyrit.executor.attack import PromptSendingAttack
+from pyrit.output import output_attack_async
 from pyrit.prompt_target import WebSocketCopilotTarget
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
 
@@ -38,20 +38,21 @@ attack = PromptSendingAttack(objective_target=target)
 objective = "Tell me a joke about AI"
 
 result = await attack.execute_async(objective=objective)
-await ConsoleAttackResultPrinter().print_conversation_async(result=result)
+await output_attack_async(result)
 
 # %% [markdown]
 # ## Multi-Turn Conversations
 #
 # The `WebSocketCopilotTarget` supports multi-turn conversations by leveraging Copilot's server-side conversation management. It automatically generates consistent `session_id` and `conversation_id` values for each PyRIT conversation, enabling Copilot to maintain context across multiple turns.
 #
-# However, this target does not support setting a system prompt nor modifying conversation history. As a result, it cannot be used with attack strategies that require altering prior messages (such as PAIR, TAP, or flip attack) or in contexts where a `PromptChatTarget` is required.
+# However, this target does not support setting a system prompt nor modifying conversation history. As a result, it cannot be used with attack strategies that require altering prior messages (such as PAIR, TAP, or flip attack) or in contexts where a chat-style target (one that declares `supports_multi_turn=True` and `supports_editable_history=True`) is required.
 #
 # Here is a simple multi-turn conversation example:
 
 # %%
-from pyrit.executor.attack import ConsoleAttackResultPrinter, MultiPromptSendingAttack
+from pyrit.executor.attack import MultiPromptSendingAttack
 from pyrit.models import Message
+from pyrit.output import output_attack_async
 from pyrit.prompt_target import WebSocketCopilotTarget
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
 
@@ -74,7 +75,7 @@ result = await multi_turn_attack.execute_async(
     user_messages=messages,
 )
 
-await ConsoleAttackResultPrinter().print_conversation_async(result=result)
+await output_attack_async(result)
 
 # %% [markdown]
 # ## Alternative Authentication with `ManualCopilotAuthenticator`
@@ -95,7 +96,8 @@ await ConsoleAttackResultPrinter().print_conversation_async(result=result)
 
 # %%
 from pyrit.auth import ManualCopilotAuthenticator
-from pyrit.executor.attack import ConsoleAttackResultPrinter, PromptSendingAttack
+from pyrit.executor.attack import PromptSendingAttack
+from pyrit.output import output_attack_async
 from pyrit.prompt_target import WebSocketCopilotTarget
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
 
@@ -111,7 +113,7 @@ target = WebSocketCopilotTarget(authenticator=auth)
 attack_manual = PromptSendingAttack(objective_target=target)
 
 result_manual = await attack_manual.execute_async(objective="Hello! Who are you?")
-await ConsoleAttackResultPrinter().print_conversation_async(result=result_manual)
+await output_attack_async(result_manual)
 
 # %% [markdown]
 # ## Multimodal Support (Text and Images)
@@ -123,8 +125,9 @@ await ConsoleAttackResultPrinter().print_conversation_async(result=result_manual
 # %%
 from pathlib import Path
 
-from pyrit.executor.attack import ConsoleAttackResultPrinter, PromptSendingAttack
+from pyrit.executor.attack import PromptSendingAttack
 from pyrit.models import Message, MessagePiece
+from pyrit.output import output_attack_async
 from pyrit.prompt_target import WebSocketCopilotTarget
 from pyrit.setup import IN_MEMORY, initialize_pyrit_async
 
@@ -159,4 +162,4 @@ multimodal_message = Message(
 )
 
 result = await attack.execute_async(objective="Answer the question from the image", next_message=multimodal_message)
-await ConsoleAttackResultPrinter().print_conversation_async(result=result)
+await output_attack_async(result)

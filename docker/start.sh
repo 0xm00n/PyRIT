@@ -37,14 +37,44 @@ fi
 echo "Checking PyRIT installation..."
 python -c "import pyrit; print(f'Running PyRIT version: {pyrit.__version__}')"
 
-# Write .env file from PYRIT_ENV_CONTENTS (injected from Key Vault secret)
+# Write .env when deploy_instance.py supplies inline content. Otherwise the
+# generated PyRIT config uses the Key Vault URL from PYRIT_ENV_AKV_REF so the
+# backend can read and update that environment source through managed identity.
 if [ -n "$PYRIT_ENV_CONTENTS" ]; then
     mkdir -p ~/.pyrit
     echo "$PYRIT_ENV_CONTENTS" > ~/.pyrit/.env
     echo "Wrote .env file from PYRIT_ENV_CONTENTS ($(wc -l < ~/.pyrit/.env) lines)"
 else
-    echo "No PYRIT_ENV_CONTENTS set — using system environment variables only"
+    echo "No inline PYRIT_ENV_CONTENTS set — using configured environment sources"
 fi
+
+write_deployment_config() {
+    local target_file="$1"
+    mkdir -p "$(dirname "$target_file")"
+    {
+        if [ -n "$AZURE_SQL_SERVER" ]; then
+            echo "Using Azure SQL database (server: $AZURE_SQL_SERVER)" >&2
+            echo "memory_db_type: AzureSQL"
+        else
+            echo "Using SQLite database (AZURE_SQL_SERVER not set)" >&2
+            echo "memory_db_type: SQLite"
+        fi
+        if [ -n "$PYRIT_INITIALIZER" ]; then
+            echo "Using initializer: $PYRIT_INITIALIZER" >&2
+            echo "initializers:"
+            # Split comma-separated initializer names into a YAML list.
+            IFS=',' read -ra INIT_NAMES <<<"$PYRIT_INITIALIZER"
+            for name in "${INIT_NAMES[@]}"; do
+                echo "  - $(echo "$name" | xargs)"
+            done
+        fi
+        if [ -n "$PYRIT_ENV_AKV_REF" ]; then
+            echo "Using Azure Key Vault environment reference" >&2
+            echo "env_akv_ref:"
+            echo "  - $PYRIT_ENV_AKV_REF"
+        fi
+    } >"$target_file"
+}
 
 # Start the appropriate service based on PYRIT_MODE
 if [ "$PYRIT_MODE" = "jupyter" ]; then
@@ -54,25 +84,46 @@ if [ "$PYRIT_MODE" = "jupyter" ]; then
     exec jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --notebook-dir=/app/notebooks
 elif [ "$PYRIT_MODE" = "gui" ]; then
     echo "Starting PyRIT GUI on port 8000..."
-    # Use Azure SQL if AZURE_SQL_SERVER is set (injected by Bicep), otherwise default to SQLite.
-    # Note: AZURE_SQL_DB_CONNECTION_STRING is in the .env file (loaded by Python dotenv),
-    # but we use AZURE_SQL_SERVER here because it's a direct env var from the Bicep template.
-    # Build CLI arguments
-    BACKEND_ARGS="--host 0.0.0.0 --port 8000"
-
-    if [ -n "$AZURE_SQL_SERVER" ]; then
-        echo "Using Azure SQL database (server: $AZURE_SQL_SERVER)"
-        BACKEND_ARGS="$BACKEND_ARGS --database AzureSQL"
+    if [ -n "${PYRIT_CONFIG_FILE:-}" ]; then
+        CONFIG_FILE="$PYRIT_CONFIG_FILE"
+        DEPLOYMENT_BASE_CONFIG="$HOME/.pyrit/.pyrit_conf"
+        if [ "$CONFIG_FILE" = "$DEPLOYMENT_BASE_CONFIG" ]; then
+            echo "ERROR: PYRIT_CONFIG_FILE cannot point to $DEPLOYMENT_BASE_CONFIG in this container" >&2
+            exit 1
+        fi
+        # ConfigurationLoader overlays the explicit source on its default file.
+        # Materialize deployment-derived values there so omitted external keys do
+        # not silently switch Azure SQL to local SQLite or drop the AKV source.
+        write_deployment_config "$DEPLOYMENT_BASE_CONFIG"
+        echo "Using external PyRIT configuration over deployment defaults"
     else
-        echo "Using SQLite database (AZURE_SQL_SERVER not set)"
+        # Translate deployment settings into a runtime config file so the FastAPI
+        # lifespan (ConfigurationLoader) picks them up on startup.
+        RUNTIME_CONFIG=/tmp/pyrit_runtime.yaml
+        write_deployment_config "$RUNTIME_CONFIG"
+        CONFIG_FILE="$RUNTIME_CONFIG"
     fi
 
-    if [ -n "$PYRIT_INITIALIZER" ]; then
-        echo "Using initializer: $PYRIT_INITIALIZER"
-        BACKEND_ARGS="$BACKEND_ARGS --initializers $PYRIT_INITIALIZER"
+    # Pick the launcher module. PR #1753 moved the launcher from
+    # ``pyrit.cli.pyrit_backend`` to ``pyrit.backend.pyrit_backend``. The PyPI
+    # docker_build CI job pins to whatever's currently published (0.13.0 at
+    # time of writing), which still uses the old path, so fall back to it when
+    # the new module isn't present. Once a release containing the new layout
+    # ships, this fallback is dead code and can be removed.
+    if python -c "import pyrit.backend.pyrit_backend" >/dev/null 2>&1; then
+        BACKEND_MODULE="pyrit.backend.pyrit_backend"
+    elif python -c "import pyrit.cli.pyrit_backend" >/dev/null 2>&1; then
+        echo "Using legacy pyrit.cli.pyrit_backend launcher (PyRIT <= 0.13.0)"
+        BACKEND_MODULE="pyrit.cli.pyrit_backend"
+    else
+        echo "ERROR: cannot find pyrit backend launcher module" >&2
+        exit 1
     fi
 
-    exec python -m pyrit.cli.pyrit_backend $BACKEND_ARGS
+    exec python -m "$BACKEND_MODULE" \
+        --host 0.0.0.0 \
+        --port 8000 \
+        --config-file "$CONFIG_FILE"
 else
     echo "ERROR: Invalid PYRIT_MODE '$PYRIT_MODE'. Must be 'jupyter' or 'gui'"
     exit 1

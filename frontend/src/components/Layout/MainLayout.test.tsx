@@ -4,6 +4,7 @@
  */
 
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { FluentProvider, webLightTheme } from "@fluentui/react-components";
 import MainLayout from "./MainLayout";
 
@@ -17,20 +18,15 @@ jest.mock("../../services/api", () => ({
 // Mock Navigation to simplify testing
 jest.mock("../Sidebar/Navigation", () => {
   const MockNavigation = ({
-    onToggleTheme,
-    isDarkMode,
     currentView,
     onNavigate,
   }: {
-    onToggleTheme: () => void;
-    isDarkMode: boolean;
     currentView: string;
     onNavigate: (view: string) => void;
   }) => {
     return (
-      <div data-testid="navigation" data-dark-mode={isDarkMode} data-current-view={currentView}>
-        <button onClick={onToggleTheme}>Toggle</button>
-        <button onClick={() => onNavigate("config")}>Config</button>
+      <div data-testid="navigation" data-current-view={currentView}>
+        <button onClick={() => onNavigate("targets")}>Targets</button>
       </div>
     );
   };
@@ -55,10 +51,10 @@ describe("MainLayout", () => {
   });
 
   const defaultProps = {
-    onToggleTheme: jest.fn(),
-    isDarkMode: false,
     currentView: 'chat' as const,
     onNavigate: jest.fn(),
+    onOpenFeedback: jest.fn(),
+    canManageConfiguration: true,
   };
 
   it("renders the header with title and subtitle", async () => {
@@ -115,11 +111,14 @@ describe("MainLayout", () => {
     });
   });
 
-  it("displays version from API in tooltip", async () => {
+  it("displays the version, commit, and database for a development release", async () => {
     mockedVersionApi.getVersion.mockResolvedValue({
-      version: "1.0.0",
-      display: "v1.0.0-beta",
+      version: "1.1.0.dev0",
+      commit: "729b7dd0446cc95412345662a1a921e2a4bf1979",
+      display: "729b7dd0446cc95412345662a1a921e2a4bf1979",
+      database_info: "AzureSQLMemory (airtprod)",
     });
+    const user = userEvent.setup();
 
     renderWithProvider(
       <MainLayout {...defaultProps}>
@@ -130,6 +129,42 @@ describe("MainLayout", () => {
     await waitFor(() => {
       expect(mockedVersionApi.getVersion).toHaveBeenCalled();
     });
+
+    await user.hover(screen.getByAltText("Co-PyRIT Logo"));
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("PyRIT 1.1.0.dev0");
+    expect(tooltip).toHaveTextContent(
+      "Commit: 729b7dd0446cc95412345662a1a921e2a4bf1979"
+    );
+    expect(tooltip).toHaveTextContent("AzureSQLMemory (airtprod)");
+  });
+
+  it("does not display the commit for a release version", async () => {
+    mockedVersionApi.getVersion.mockResolvedValue({
+      version: "1.1.0",
+      commit: "729b7dd0446cc95412345662a1a921e2a4bf1979",
+      display: "729b7dd0446cc95412345662a1a921e2a4bf1979",
+      database_info: "AzureSQLMemory (airtprod)",
+    });
+    const user = userEvent.setup();
+
+    renderWithProvider(
+      <MainLayout {...defaultProps}>
+        <div>Content</div>
+      </MainLayout>
+    );
+
+    await waitFor(() => {
+      expect(mockedVersionApi.getVersion).toHaveBeenCalled();
+    });
+
+    await user.hover(screen.getByAltText("Co-PyRIT Logo"));
+
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("PyRIT 1.1.0");
+    expect(tooltip).not.toHaveTextContent("Commit:");
+    expect(tooltip).toHaveTextContent("AzureSQLMemory (airtprod)");
   });
 
   it("displays 'Unknown' when version API fails", async () => {
@@ -146,17 +181,51 @@ describe("MainLayout", () => {
     });
   });
 
-  it("passes theme props to Navigation", async () => {
+  it("renders a 'Take a tour' button in the top bar when onStartTour is provided", async () => {
     mockedVersionApi.getVersion.mockResolvedValue({ version: "1.0.0" });
 
     renderWithProvider(
-      <MainLayout {...defaultProps} isDarkMode={true}>
+      <MainLayout {...defaultProps} onStartTour={jest.fn()}>
         <div>Content</div>
       </MainLayout>
     );
 
-    const navigation = screen.getByTestId("navigation");
-    expect(navigation).toHaveAttribute("data-dark-mode", "true");
+    expect(screen.getByRole("button", { name: /take a tour/i })).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(mockedVersionApi.getVersion).toHaveBeenCalled();
+    });
+  });
+
+  it("calls onStartTour when the 'Take a tour' button is clicked", async () => {
+    mockedVersionApi.getVersion.mockResolvedValue({ version: "1.0.0" });
+    const onStartTour = jest.fn();
+    const user = userEvent.setup();
+
+    renderWithProvider(
+      <MainLayout {...defaultProps} onStartTour={onStartTour}>
+        <div>Content</div>
+      </MainLayout>
+    );
+
+    await user.click(screen.getByRole("button", { name: /take a tour/i }));
+    expect(onStartTour).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => {
+      expect(mockedVersionApi.getVersion).toHaveBeenCalled();
+    });
+  });
+
+  it("does not render the 'Take a tour' button when onStartTour is not provided", async () => {
+    mockedVersionApi.getVersion.mockResolvedValue({ version: "1.0.0" });
+
+    renderWithProvider(
+      <MainLayout {...defaultProps}>
+        <div>Content</div>
+      </MainLayout>
+    );
+
+    expect(screen.queryByRole("button", { name: /take a tour/i })).not.toBeInTheDocument();
 
     await waitFor(() => {
       expect(mockedVersionApi.getVersion).toHaveBeenCalled();

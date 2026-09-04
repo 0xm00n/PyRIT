@@ -43,6 +43,18 @@ class TestTokenizerTemplateNormalizerInit:
         assert "qwen" in aliases
         assert "llama3" in aliases
 
+    def test_identifier_includes_behavior_changing_configuration(self):
+        tokenizer = MagicMock()
+        tokenizer.name_or_path = "example/tokenizer"
+        tokenizer.chat_template = "{{ messages }}"
+        tokenizer.special_tokens_map = {"bos_token": "<s>"}
+
+        keep = TokenizerTemplateNormalizer(tokenizer=tokenizer, system_message_behavior="keep")
+        ignore = TokenizerTemplateNormalizer(tokenizer=tokenizer, system_message_behavior="ignore")
+
+        assert keep.get_identifier().hash != ignore.get_identifier().hash
+        assert keep.get_identifier().params["chat_template"] == '"{{ messages }}"'
+
 
 class TestFromModel:
     """Tests for the from_model factory method."""
@@ -128,7 +140,6 @@ class TestNormalizeStringAsync:
         mock_tokenizer.apply_chat_template.side_effect = _apply_chatml_template
         return TokenizerTemplateNormalizer(tokenizer=mock_tokenizer)
 
-    @pytest.mark.asyncio
     async def test_normalize_chatml(self, chatml_tokenizer_normalizer: TokenizerTemplateNormalizer):
         messages = [
             _make_message("system", "You are a friendly chatbot who always responds in the style of a pirate"),
@@ -146,7 +157,6 @@ class TestNormalizeStringAsync:
 
         assert await chatml_tokenizer_normalizer.normalize_string_async(messages) == expected
 
-    @pytest.mark.asyncio
     async def test_normalize_uses_converted_value(self):
         """Test that normalize uses converted_value when available."""
         mock_tokenizer = MagicMock()
@@ -165,7 +175,6 @@ class TestNormalizeStringAsync:
         call_args = mock_tokenizer.apply_chat_template.call_args
         assert call_args[0][0] == [{"role": "user", "content": "converted"}]
 
-    @pytest.mark.asyncio
     async def test_normalize_falls_back_to_original_value(self):
         """Test that normalize falls back to original_value when converted_value is None."""
         mock_tokenizer = MagicMock()
